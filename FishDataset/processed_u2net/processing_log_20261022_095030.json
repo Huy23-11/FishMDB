@@ -1,0 +1,11 @@
+{
+  "stats": {
+    "total": 1007,
+    "success": 415,
+    "failed": 0,
+    "skipped": 592
+  },
+  "errors": [],
+  "timestamp": "2026-10-22T09:50:30.442339",
+  "elapsed_time": 711.6348719596863
+}

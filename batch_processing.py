@@ -11,6 +11,7 @@ Flow:
 
 import os
 import json
+import numpy as np
 import psycopg2
 from psycopg2.extras import Json
 from pathlib import Path
@@ -21,6 +22,24 @@ import time
 from extract_shape_features import ShapeFeatureExtractor
 from extract_texture_features import TextureFeatureExtractor
 from extract_color_features import ColorFeatureExtractor
+
+
+def to_native(obj):
+    """
+    Convert đệ quy các kiểu numpy (int32, float32, ndarray...) sang kiểu
+    Python thuần (int, float, list), vì json.dumps (dùng bên trong
+    psycopg2.extras.Json) không serialize được kiểu numpy.
+    """
+    if isinstance(obj, dict):
+        return {k: to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [to_native(v) for v in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.generic):  # numpy scalar: int32, float32, bool_, ...
+        return obj.item()
+    else:
+        return obj
 
 
 class DatabaseManager:
@@ -97,10 +116,38 @@ class DatabaseManager:
             print(f"✗ Lỗi insert species: {str(e)}")
             return None
 
+    def get_existing_image(self, original_path):
+        """
+        Kiểm tra xem ảnh (theo original_path) đã có trong DB chưa.
+
+        Returns:
+            tuple (image_id, is_feature_extracted) nếu đã tồn tại, ngược lại None
+        """
+        try:
+            self.cursor.execute(
+                "SELECT image_id, is_feature_extracted FROM fish_images WHERE original_path = %s",
+                (original_path,)
+            )
+            result = self.cursor.fetchone()
+            if result:
+                return (result[0], result[1])
+            return None
+
+        except Exception as e:
+            print(f"✗ Lỗi kiểm tra image tồn tại: {str(e)}")
+            return None
+
     def insert_image(self, species_id, original_path, processed_path, width, height, file_size_kb):
         """
         Thêm ảnh mới vào bảng fish_images.
+        Nếu original_path đã tồn tại (ảnh đã được xử lý ở lần chạy trước),
+        trả về image_id có sẵn thay vì insert mới (tránh lỗi duplicate key).
         """
+        # Check đã tồn tại chưa trước (resume logic)
+        existing = self.get_existing_image(original_path)
+        if existing:
+            return existing[0]  # trả về image_id có sẵn
+
         try:
             self.cursor.execute(
                 """
@@ -274,6 +321,12 @@ class BatchProcessor:
             filename = image_path.name
             print(f"\n[{self.stats['success'] + self.stats['failed'] + 1}/{self.stats['total']}] Xử lý: {filename}")
 
+            # 0. Kiểm tra đã xử lý xong (resume) chưa - skip nếu đã có feature_vectors
+            existing = self.db.get_existing_image(str(image_path))
+            if existing and existing[1]:  # is_feature_extracted == True
+                print("  ⊘ Đã xử lý trước đó, bỏ qua.")
+                return (True, "SKIPPED")
+
             # 1. Parse species
             species_vn, species_en = self.parse_species_from_filename(filename)
 
@@ -327,6 +380,11 @@ class BatchProcessor:
 
             # 8. Lưu features vào database
             print("  → Lưu vào database...", end=" ")
+            # Convert numpy types (int32, float32, ndarray...) sang Python thuần
+            # trước khi JSON-serialize, tránh lỗi "Object of type int32 is not JSON serializable"
+            shape_features = to_native(shape_features)
+            texture_features = to_native(texture_features)
+            color_features = to_native(color_features)
             success = self.db.insert_features(image_id, shape_features, texture_features, color_features)
             if not success:
                 return (False, "Lỗi lưu features vào database")
@@ -342,7 +400,10 @@ class BatchProcessor:
         Xử lý toàn bộ ảnh trong thư mục.
         """
         # Lấy danh sách ảnh PNG
-        image_files = list(self.input_folder.glob("*.png")) + list(self.input_folder.glob("*.PNG"))
+        # NOTE: trên Windows (filesystem không phân biệt hoa/thường), glob("*.png")
+        # và glob("*.PNG") trả về CÙNG một tập file -> phải dedupe bằng set(),
+        # nếu không mỗi ảnh sẽ bị đếm và xử lý 2 lần.
+        image_files = sorted(set(self.input_folder.glob("*.png")) | set(self.input_folder.glob("*.PNG")))
         self.stats['total'] = len(image_files)
 
         print(f"\n{'='*70}")
@@ -356,7 +417,9 @@ class BatchProcessor:
         for image_path in image_files:
             success, error_msg = self.process_single_image(image_path)
 
-            if success:
+            if success and error_msg == "SKIPPED":
+                self.stats['skipped'] += 1
+            elif success:
                 self.stats['success'] += 1
                 print(f"  ✓ Thành công!")
             else:
@@ -427,27 +490,131 @@ if __name__ == "__main__":
         'port': 5432,
         'database': 'fish_database',
         'user': 'postgres',
-        'password': 'your_password'
+        'password': 'PassW0rd@'
     }
 
     # Input folder (ảnh PNG đã tách nền)
-    INPUT_FOLDER = "D:/FishDataset/processed"
+    INPUT_FOLDER = r"C:\Users\messi2015\FishMDB\FishDataset\processed_u2net"
 
     # Species mapping (filename pattern → (name_vn, name_en))
     SPECIES_MAPPING = {
-        'ca_loc': ('Cá Lóc', 'Snakehead'),
-        'ca_dao': ('Cá Dao', 'Knifefish'),
+        # 1. Nhóm cá trong bộ dữ liệu gốc (Kaggle)
+        'bangus': ('Cá Mòng Biển', 'Bangus'),
+        'big_head_carp': ('Cá Mè Hoa', 'Big Head Carp'),
+        'black_spotted_barb': ('Cá Mè Vinh Đốm Đen', 'Black Spotted Barb'),
+        'catfish': ('Cá Trê', 'Catfish'),
+        'climbing_perch': ('Cá Rô Đồng', 'Climbing Perch'),
+        'fourfinger_threadfin': ('Cá Chét', 'Fourfinger Threadfin'),
         'ca_luon': ('Cá Lươn', 'Freshwater Eel'),
-        'ca_bon': ('Cá Bơn', 'Flounder'),
-        'ca_mola': ('Cá Mặt Trăng', 'Mola Mola'),
-        'ca_su_tu': ('Cá Sư Tử', 'Lionfish'),
+        'glass_perchlet': ('Cá Sơn Thủy Tinh', 'Glass Perchlet'),
+        'goby': ('Cá Bống', 'Goby'),
         'ca_vang': ('Cá Vàng', 'Goldfish'),
-        'ca_he': ('Cá Hề', 'Clownfish'),
+        'gourami': ('Cá Sặc', 'Gourami'),
+        'grass_carp': ('Cá Trắm Cỏ', 'Grass Carp'),
+        'green_spotted_puffer': ('Cá Nóc Chấm Xanh', 'Green Spotted Puffer'),
+        'indian_carp': ('Cá Chép Ấn Độ', 'Indian Carp'),
+        'indo_pacific_tarpon': ('Cá Chép Biển Ấn - Thái', 'Indo-Pacific Tarpon'),
+        'jaguar_gapote': ('Cá Cichlid Jaguar', 'Jaguar Gapote'),
+        'janitor_fish': ('Cá Lau Kính', 'Janitor Fish'),
+        'ca_dao': ('Cá Dao', 'Knifefish'),
+        'long_snouted_pipefish': ('Cá Chìa Vôi Mõm Dài', 'Long-Snouted Pipefish'),
+        'mosquito_fish': ('Cá Muỗi', 'Mosquito Fish'),
+        'ca_loc': ('Cá Lóc', 'Snakehead'),
+        'mullet': ('Cá Đối', 'Mullet'),
+        'pangasius': ('Cá Tra', 'Pangasius'),
+        'perch': ('Cá Vược Châu Âu', 'Perch'),
+        'scat_fish': ('Cá Đối Mục', 'Scat Fish'),
+        'silver_barb': ('Cá Mè Vinh', 'Silver Barb'),
+        'silver_carp': ('Cá Mè Trắng', 'Silver Carp'),
+        'silver_perch': ('Cá Rô Bạc', 'Silver Perch'),
+        'tenpounder': ('Cá Rựa', 'Tenpounder'),
+        'tilapia': ('Cá Rô Phi', 'Tilapia'),
+
+        # 2. Nhóm cá nước ngọt, nước lợ và đặc sản sông ngòi bổ sung
         'ca_hoi': ('Cá Hồi', 'Salmon'),
+        'bass': ('Cá Vược', 'Bass'),
+        'sturgeon': ('Cá Tầm', 'Sturgeon'),
+        'common_carp': ('Cá Chép Thường', 'Common Carp'),
+        'red_tilapia': ('Cá Diêu Hồng', 'Red Tilapia'),
+        'black_carp': ('Cá Trắm Đen', 'Black Carp'),
+        'loach': ('Cá Chạch', 'Loach'),
+        'bronze_featherback': ('Cá Thát Lát', 'Bronze Featherback'),
+        'snakeskin_gourami': ('Cá Sặc Rằn', 'Snakeskin Gourami'),
+        'mud_carp': ('Cá Trôi', 'Mud Carp'),
+        'mudskipper': ('Cá Kèo', 'Mudskipper'),
+        'bagrid_catfish': ('Cá Lăng', 'Bagrid Catfish'),
+        'barramundi': ('Cá Chẽm', 'Barramundi'),
+        'giant_barb': ('Cá Hô', 'Giant Barb'),
+        'ca_linh': ('Cá Linh', 'Siamese Mud Carp'),
+        'alligator_gar': ('Cá Sấu Hỏa Tiễn', 'Alligator Gar'),
+        'arapaima': ('Cá Hải Tượng', 'Arapaima'),
+        'giant_gourami': ('Cá Tai Tượng', 'Giant Gourami'),
+        'bong_tuong': ('Cá Bống Tượng', 'Marble Goby'),
+        'ca_ngat': ('Cá Ngát', 'Eeltail Catfish'),
+        'ca_dua': ('Cá Dứa', 'Tra Catfish'),
+        'leather_carp': ('Cá Chép Không Vảy', 'Leather Carp'),
+
+        # 3. Nhóm cá biển và thương mại bổ sung
         'ca_ngu': ('Cá Ngừ', 'Tuna'),
-        'koi': ('Cá Koi', 'Koi'),
+        'mackerel': ('Cá Thu', 'Mackerel'),
+        'swordfish': ('Cá Kiếm', 'Swordfish'),
+        'grouper': ('Cá Mú', 'Grouper'),
+        'ca_bon': ('Cá Bơn', 'Flounder'),
+        'red_snapper': ('Cá Hồng', 'Red Snapper'),
+        'stingray': ('Cá Đuối', 'Stingray'),
+        'ca_he': ('Cá Hề', 'Clownfish'),
+        'scad': ('Cá Nục', 'Scad'),
+        'pomfret': ('Cá Chim', 'Pomfret'),
+        'yellowstripe_scad': ('Cá Chỉ Vàng', 'Yellowstripe Scad'),
+        'sardine': ('Cá Trích', 'Sardine'),
+        'triggerfish': ('Cá Bò', 'Triggerfish'),
+        'cobia': ('Cá Bớp', 'Cobia'),
+        'anchovy': ('Cá Cơm', 'Anchovy'),
+        'bombay_duck': ('Cá Khoai', 'Bombay Duck'),
+        'shark': ('Cá Mập', 'Shark'),
+        'moray_eel': ('Cá Chình', 'Moray Eel'),
+
+        # 4. Nhóm cá cảnh phổ biến
         'betta': ('Cá Xiêm', 'Betta'),
-        # Thêm các loài khác...
+        'guppy': ('Cá Bảy Màu', 'Guppy'),
+        'flowerhorn': ('Cá La Hán', 'Flowerhorn'),
+        'arowana': ('Cá Rồng', 'Arowana'),
+        'discus': ('Cá Dĩa', 'Discus'),
+        'koi': ('Cá Koi', 'Koi'),
+        'angelfish': ('Cá Thần Tiên', 'Angelfish'),
+        'neon_tetra': ('Cá Neon', 'Neon Tetra'),
+        'swordtail': ('Cá Đuôi Kiếm', 'Swordtail'),
+        'corydoras': ('Cá Chuột', 'Corydoras'),
+        'clown_loach': ('Cá Heo Nước Ngọt', 'Clown Loach'),
+        'blood_parrot': ('Cá Hồng Két', 'Blood Parrot Cichlid'),
+        'bala_shark': ('Cá Mập Thái', 'Bala Shark'),
+        'ram_cichlid': ('Cá Phượng Hoàng', 'Ram Cichlid'),
+
+        # 5. Nhóm cá có hình dáng và đặc điểm kỳ dị, độc lạ
+        'seahorse': ('Cá Ngựa', 'Seahorse'),
+        'ca_su_tu': ('Cá Sư Tử', 'Lionfish'),
+        'ca_mola': ('Cá Mặt Trăng', 'Mola Mola'),
+        'flying_fish': ('Cá Chuồn', 'Flying Fish'),
+        'blue_tang': ('Cá Đuôi Gai', 'Blue Tang'),
+        'butterflyfish': ('Cá Bướm', 'Butterflyfish'),
+        'parrotfish': ('Cá Mó', 'Parrotfish'),
+        'emperor_angelfish': ('Cá Hoàng Đế', 'Emperor Angelfish'),
+        'damselfish': ('Cá Thia Biển', 'Damselfish'),
+        'porcupinefish': ('Cá Nóc Nhím', 'Porcupinefish'),
+        'hairtail': ('Cá Hố', 'Largehead Hairtail'),
+        'trumpetfish': ('Cá Chìa Vôi Biển', 'Trumpetfish'),
+        'frogfish': ('Cá Mao Ếch', 'Frogfish'),
+        'batfish': ('Cá Dơi', 'Batfish'),
+        'napoleon_wrasse': ('Cá Bàng Chài Napoleon', 'Napoleon Wrasse'),
+        'mandarinfish': ('Cá Đàn Lia Gai', 'Mandarinfish'),
+        'pleco': ('Cá Tỳ Bà', 'Pleco'),
+        'lanternfish': ('Cá Lồng Đèn', 'Lanternfish'),
+        'oarfish': ('Cá Mái Chèo', 'Oarfish'),
+        'stonefish': ('Cá Mặt Quỷ', 'Stonefish'),
+        'archerfish': ('Cá Mang Rổ', 'Archerfish'),
+        'coelacanth': ('Cá Vây Tay', 'Coelacanth'),
+        'moorish_idol': ('Cá Thù Lù', 'Moorish Idol'),
+        'elephantnose_fish': ('Cá Nheo Mũi Hình Ống', 'Elephantnose Fish'),
     }
 
     # =====================================

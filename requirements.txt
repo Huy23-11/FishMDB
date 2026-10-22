@@ -1,23 +1,10 @@
-# Computer Vision
-opencv-python==4.8.1.78
-opencv-contrib-python==4.8.1.78
-
-# Scientific Computing
-numpy==1.24.3
-scipy==1.11.4
-
-# Image Processing
-scikit-image==0.21.0
-Pillow==10.1.0
-
-# Machine Learning
-scikit-learn==1.3.2
-
-# Wavelets
-PyWavelets==1.4.1
-
-# Background Removal (U2Net)
-rembg==2.0.50
-
-# Database
-psycopg2-binary==2.9.9
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+numpy>=1.26.0
+scipy>=1.11.0
+scikit-image>=0.22.0
+Pillow>=10.0.0
+scikit-learn>=1.3.0
+PyWavelets>=1.5.0
+rembg>=2.0.50
+psycopg2-binary>=2.9.0

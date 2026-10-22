@@ -35,6 +35,9 @@ class ColorFeatureExtractor:
         if self.img.shape[2] == 4:  # RGBA
             self.rgb = self.img[:, :, :3]
             self.mask = self.img[:, :, 3]
+            if self.mask.max() > 0 and self.mask.max() < 255:
+                self.mask = cv2.normalize(self.mask, None, 0, 255, cv2.NORM_MINMAX)
+            _, self.mask = cv2.threshold(self.mask, 0, 255, cv2.THRESH_BINARY)
         else:  # RGB
             self.rgb = self.img
             gray = cv2.cvtColor(self.img, cv2.COLOR_BGR2GRAY)

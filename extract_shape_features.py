@@ -13,6 +13,7 @@ import numpy as np
 from scipy.fft import fft
 from scipy.spatial import distance
 import json
+import traceback
 
 
 class ShapeFeatureExtractor:
@@ -35,6 +36,12 @@ class ShapeFeatureExtractor:
         # Tách alpha channel (mask)
         if self.img.shape[2] == 4:  # RGBA
             self.mask = self.img[:, :, 3]
+            # Normalize mask về 0-255 (fix ảnh U2Net bị scale sai alpha)
+            if self.mask.max() > 0 and self.mask.max() < 255:
+                self.mask = cv2.normalize(self.mask, None, 0, 255, cv2.NORM_MINMAX)
+            # Binarize luôn cho chắc
+            _, self.mask = cv2.threshold(self.mask, 0, 255, cv2.THRESH_BINARY)
+            # =====================
         else:  # RGB (không có alpha)
             # Convert sang grayscale rồi threshold
             gray = cv2.cvtColor(self.img, cv2.COLOR_BGR2GRAY)
@@ -320,7 +327,12 @@ class ShapeFeatureExtractor:
         if len(hull) < 3:
             return [0.0, 0.0, 0.0, 0.0]
 
-        defects = cv2.convexityDefects(self.contour, hull)
+        try:
+            defects = cv2.convexityDefects(self.contour, hull)
+        except cv2.error:
+            # Contour tự cắt chính nó (self-intersecting) ở mức pixel -
+            # OpenCV không tính được convexity defects cho trường hợp này
+            return [0.0, 0.0, 0.0, 0.0]
 
         if defects is None:
             return [0.0, 0.0, 0.0, 0.0]
@@ -330,7 +342,7 @@ class ShapeFeatureExtractor:
         defect_areas = []
 
         for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
+            s, e, f, d = defects[i].flatten()
             # d = distance từ farthest point đến hull (scaled by 256)
             defect_areas.append(d / 256.0)
 
@@ -405,6 +417,7 @@ class ShapeFeatureExtractor:
 
         except Exception as e:
             print(f"Lỗi khi trích xuất đặc trưng từ {self.image_path}: {str(e)}")
+            traceback.print_exc()
             return None
 
 
